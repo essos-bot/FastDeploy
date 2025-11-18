@@ -961,6 +961,63 @@ class PlasAttentionConfig:
                 self.plas_use_decoder_seq_limit = self.plas_decoder_top_k_left * self.plas_block_size
             self.check_legality_parameters()
 
+
+class InfLLMV2Config:
+    """
+    InfLLM-V2 sparse attention configuration class.
+    """
+
+    def __init__(
+        self,
+        args=None,
+    ):
+        # InfLLM-V2 核心参数
+        self.infllmv2_kernel_size: int = 32
+        "Size of semantic kernels for InfLLM-V2 sparse attention"
+
+        self.infllmv2_kernel_stride: int = 16
+        "Stride between adjacent semantic kernels"
+
+        self.infllmv2_topk: int = 64
+        "Number of top-k blocks to select for each query token"
+
+        self.infllmv2_block_size: int = 64
+        "Size of KV cache blocks for block-sparse attention"
+
+        self.infllmv2_window_size: int = 2048
+        "Local sliding window size for dense attention fallback"
+
+        self.infllmv2_dense_len: int = 8192
+        "Sequence length threshold for switching from dense to sparse attention"
+
+        self.infllmv2_init_blocks: int = 1
+        "Number of initial blocks that every query token attends to"
+
+        self.infllmv2_use_nope: bool = False
+        "Whether to use NOPE technique in block selection"
+
+        if args is not None:
+            for key, value in args.items():
+                if hasattr(self, key):
+                    setattr(self, key, value)
+
+        self._validate_parameters()
+
+    def _validate_parameters(self):
+        """Validate InfLLM-V2 configuration parameters"""
+        if self.infllmv2_kernel_size <= 0:
+            raise ValueError("infllmv2_kernel_size must be positive")
+        if self.infllmv2_kernel_stride <= 0:
+            raise ValueError("infllmv2_kernel_stride must be positive")
+        if self.infllmv2_topk <= 0:
+            raise ValueError("infllmv2_topk must be positive")
+        if self.infllmv2_block_size <= 0:
+            raise ValueError("infllmv2_block_size must be positive")
+        if self.infllmv2_dense_len < 0:
+            raise ValueError("infllmv2_dense_len cannot be negative")
+        if self.infllmv2_kernel_stride > self.infllmv2_kernel_size:
+            raise ValueError("infllmv2_kernel_stride should not exceed infllmv2_kernel_size")
+
     def check_legality_parameters(
         self,
     ) -> None:
@@ -1439,6 +1496,7 @@ class FDConfig:
         graph_opt_config: GraphOptimizationConfig = None,
         plas_attention_config: PlasAttentionConfig = None,
         speculative_config: SpeculativeConfig = None,
+        infllmv2_config: InfLLMV2Config = None,
         eplb_config: EPLBConfig = None,
         structured_outputs_config: StructuredOutputsConfig = None,
         router_config: RouterConfig = None,
@@ -1468,6 +1526,7 @@ class FDConfig:
         self.early_stop_config: Optional[EarlyStopConfig] = early_stop_config
         self.cache_config: CacheConfig = cache_config  # type: ignore
         self.plas_attention_config: Optional[PlasAttentionConfig] = plas_attention_config
+        self.infllmv2_config: Optional[InfLLMV2Config] = infllmv2_config
         self.structured_outputs_config: StructuredOutputsConfig = structured_outputs_config
         self.router_config: RouterConfig = router_config
 

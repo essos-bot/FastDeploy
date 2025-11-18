@@ -28,6 +28,7 @@ class _Backend(enum.Enum):
     BLOCK_ATTN = enum.auto()
     PLAS_ATTN = enum.auto()
     HPU_ATTN = enum.auto()
+    INFLLMV2_ATTN = enum.auto()
 
 
 class Platform:

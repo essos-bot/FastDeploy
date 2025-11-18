@@ -501,6 +501,10 @@ elif paddle.is_compiled_with_cuda():
         sources += find_end_files("gpu_ops/wfp8afp8_sparse_gemm", ".cu")
         os.system("python gpu_ops/machete/generate.py")
         sources += find_end_files("gpu_ops/machete", ".cu")
+
+        # Add InfLLM-V2 CUDA kernels
+        sources += find_end_files("gpu_ops/infllmv2_attention", ".cu")
+        nvcc_compile_args += ["-Igpu_ops/infllmv2_attention"]
         cc_compile_args += ["-DENABLE_MACHETE"]
 
     setup(

@@ -2,6 +2,8 @@
 
 基于对FastDeploy代码架构的深入分析，我制定了为FastDeploy新增MiniCPM4.1-8B模型支持的完整实施方案：
 
+minicpm仓库本地地址: /data/liujun/learning/paddles/hackthon9th/myForks/MiniCPM
+
 ## 一、项目概述
 
 **目标**：为FastDeploy提供高性能的MiniCPM4.1-8B系列模型部署能力，支持多硬件平台和量化推理

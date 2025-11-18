@@ -67,8 +67,11 @@ class CUDAPlatform(Platform):
         elif selected_backend == _Backend.PLAS_ATTN:
             logger.info("Using PLAS ATTN backend.")
             return "fastdeploy.model_executor.layers.attention.PlasAttentionBackend"
+        elif selected_backend == _Backend.INFLLMV2_ATTN:
+            logger.info("Using INFLLM-V2 ATTN backend.")
+            return "fastdeploy.model_executor.layers.attention.infllmv2_attention_backend.InfLLMV2AttentionBackend"
         else:
             raise ValueError(
                 "Invalid attention backend you specified.\n"
-                "Now only support [NATIVE_ATTN, MLA_ATTN, APPEND_ATTN] in cuda place."
+                "Now only support [NATIVE_ATTN, MLA_ATTN, APPEND_ATTN, PLAS_ATTN, INFLLMV2_ATTN] in cuda place."
             )

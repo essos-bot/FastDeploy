@@ -19,6 +19,7 @@ from typing import Dict, List, Type
 from fastdeploy.utils import parse_quantization
 
 from .quant_base import QuantConfigBase
+from .minicpm41_quant_parser import parse_minicpm41_quant_config
 
 QUANTIZATION_METHODS: List[str] = [
     "wint2",
