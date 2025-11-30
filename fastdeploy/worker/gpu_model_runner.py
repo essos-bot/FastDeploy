@@ -521,7 +521,28 @@ class GPUModelRunner(ModelRunnerBase):
             if hasattr(request, "pooling_params") and request.pooling_params is not None:
                 batch_pooling_params.append(request.pooling_params)
 
+            logits_info = None
+            prefill_tokens = []
             if request.task_type.value == RequestType.PREFILL.value:  # prefill task
+                # guided decoding
+                if (
+                    request.guided_json is not None
+                    or request.guided_regex is not None
+                    or request.structural_tag is not None
+                    or request.guided_grammar is not None
+                ):
+                    logits_info, schemata_key = self._init_logits_processor(request)
+                    request.schemata_key = schemata_key
+
+                    if self.scheduler_config.splitwise_role == "decode":
+                        if (
+                            hasattr(request, "prefill_end_index")
+                            and hasattr(request, "prompt_token_ids")
+                            and request.prefill_end_index > len(request.prompt_token_ids)
+                        ):
+                            if hasattr(request, "output_token_ids"):
+                                prefill_tokens.extend(request.output_token_ids)
+
                 prefill_start_index = request.prefill_start_index
                 prefill_end_index = request.prefill_end_index
                 length = prefill_end_index - prefill_start_index
@@ -625,7 +646,6 @@ class GPUModelRunner(ModelRunnerBase):
             )
 
             self.share_inputs["first_token_ids"][idx : idx + 1] = self.share_inputs["input_ids"][idx : idx + 1, :1]
-            self.share_inputs["ori_seq_lens_encoder"][idx : idx + 1] = length
 
             if request.get("seed") is not None:
                 self.share_inputs["infer_seed"][idx : idx + 1] = request.get("seed")
@@ -656,6 +676,8 @@ class GPUModelRunner(ModelRunnerBase):
             self.pooling_params = batch_pooling_params
             # For logits processors
             self.share_inputs["logits_processors_args"][idx] = request.get("logits_processors_args") or {}
+
+            self.sampler.apply_logits_processor(idx, logits_info, prefill_tokens)
 
         if len(multi_vision_inputs["images_lst"]) > 0:
             self.share_inputs["image_features"] = self.extract_vision_features(multi_vision_inputs)
@@ -841,7 +863,6 @@ class GPUModelRunner(ModelRunnerBase):
             self.share_inputs["stop_flags"][idx : idx + 1] = False
 
             self.share_inputs["first_token_ids"][idx : idx + 1] = self.share_inputs["input_ids"][idx : idx + 1, :1]
-            self.share_inputs["ori_seq_lens_encoder"][idx : idx + 1] = length
 
             if request.get("seed") is not None:
                 self.share_inputs["infer_seed"][idx : idx + 1] = request.get("seed")
@@ -994,7 +1015,6 @@ class GPUModelRunner(ModelRunnerBase):
             self.share_inputs["stop_flags"][idx : idx + 1] = False
             self.share_inputs["temperature"][idx : idx + 1] = 1
             self.share_inputs["first_token_ids"][idx : idx + 1] = self.share_inputs["input_ids"][idx : idx + 1, :1]
-            self.share_inputs["ori_seq_lens_encoder"][idx : idx + 1] = input_length
 
             self.share_inputs["encoder_block_lens"][idx : idx + 1] = block_num
             self.share_inputs["block_tables"][idx : idx + 1, :block_num] = np.arange(
@@ -1078,7 +1098,6 @@ class GPUModelRunner(ModelRunnerBase):
         self.share_inputs["used_list_len"] = paddle.full([max_num_seqs], 0, dtype="int32")
         self.share_inputs["infer_seed"] = paddle.full([max_num_seqs, 1], 0, dtype="int64").cpu()
         self.share_inputs["first_token_ids"] = paddle.full([max_num_seqs, 1], -1, dtype="int64")
-        self.share_inputs["ori_seq_lens_encoder"] = paddle.full([max_num_seqs, 1], 0, dtype="int32")
         self.share_inputs["system_lens"] = paddle.full([max_num_seqs, 1], 0, dtype="int32")
         self.share_inputs["system_ids"] = paddle.full([max_num_seqs, 1], -1, dtype="int32")
 
@@ -1749,7 +1768,9 @@ class GPUModelRunner(ModelRunnerBase):
         if self.speculative_decoding:
             if self.speculative_method == "mtp":
                 self.proposer.run(
-                    full_hidden_states=model_output, step_use_cudagraph=self.forward_meta.step_use_cudagraph
+                    full_hidden_states=model_output,
+                    step_use_cudagraph=self.forward_meta.step_use_cudagraph,
+                    is_dummy_run=True,
                 )
             else:
                 self.proposer.run(share_inputs=self.share_inputs)
@@ -1758,8 +1779,8 @@ class GPUModelRunner(ModelRunnerBase):
 
     def _dummy_run(
         self,
-        num_tokens: paddle.Tensor,
-        batch_size: paddle.Tensor,
+        num_tokens: int,
+        batch_size: int,
         expected_decode_len: int = 1,
         in_capturing: bool = False,
         capture_prefill: bool = False,
@@ -1805,21 +1826,20 @@ class GPUModelRunner(ModelRunnerBase):
             # 3. Run model
             if self.enable_mm:
                 model_output = self.model(
-                    self.share_inputs["ids_remove_padding"],
+                    self.forward_meta.ids_remove_padding,
                     self.share_inputs["image_features"],
                     self.forward_meta,
                 )
             else:
                 model_output = self.model(
-                    ids_remove_padding=self.share_inputs["ids_remove_padding"],
-                    forward_meta=self.forward_meta,
+                    self.forward_meta.ids_remove_padding,
+                    self.forward_meta,
                 )
             if self.use_cudagraph:
                 model_output = model_output[: self.real_token_num]
 
             if self.is_pooling_model:
-                hidden_states = model_output
-                self._dummy_pooler_run(hidden_states, model_output)
+                self._dummy_pooler_run(model_output, model_output)
                 break
             else:
                 hidden_states = rebuild_padding(
@@ -2059,6 +2079,21 @@ class GPUModelRunner(ModelRunnerBase):
             if self.share_inputs["step_idx"][idx] == 0:
                 prefill_done_idxs.append(idx)
 
+        if envs.ENABLE_V1_KVCACHE_SCHEDULER:
+            if model_forward_batch is None:
+                return prefill_done_idxs
+
+            for task in model_forward_batch:
+                if task.task_type.value != RequestType.PREFILL.value:
+                    continue
+                # in chunk prefill
+                if self.cache_config.enable_chunked_prefill:
+                    if hasattr(task, "prefill_end_index") and hasattr(task, "prompt_token_ids"):
+                        if len(task.prompt_token_ids) > task.prefill_end_index and task.idx in prefill_done_idxs:
+                            prefill_done_idxs.remove(task.idx)
+
+            return prefill_done_idxs
+
         if self.cache_config.enable_chunked_prefill:
             if model_forward_batch is not None:
                 for task in model_forward_batch:
@@ -2114,14 +2149,14 @@ class GPUModelRunner(ModelRunnerBase):
         # 3. Execute model
         if self.enable_mm:
             model_output = self.model(
-                self.share_inputs["ids_remove_padding"],
+                self.forward_meta.ids_remove_padding,
                 self.share_inputs["image_features"],
                 self.forward_meta,
             )
         else:
             model_output = self.model(
-                ids_remove_padding=self.share_inputs["ids_remove_padding"],
-                forward_meta=self.forward_meta,
+                self.forward_meta.ids_remove_padding,
+                self.forward_meta,
             )
         if self.use_cudagraph:
             model_output = model_output[: self.real_token_num]
@@ -2129,8 +2164,7 @@ class GPUModelRunner(ModelRunnerBase):
         prompt_logprobs_list = self._get_prompt_logprobs_list(model_output)
 
         if self.is_pooling_model:
-            hidden_states = model_output
-            pooler_output = self._pool(hidden_states, num_running_requests)
+            pooler_output = self._pool(model_output, num_running_requests)
 
             model_output_data = ModelOutputData(
                 next_tokens=self.share_inputs["next_tokens"],
