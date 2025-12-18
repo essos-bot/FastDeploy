@@ -43,17 +43,17 @@ from fastdeploy.model_executor.models.model_base import (
     ModelCategory,
     ModelForCasualLM,
     ModelRegistry,
-    WeightsMapper,
 )
+from fastdeploy.model_executor.utils import WeightsMapper
 
 
 @ModelRegistry.register_model_class(
-    architecture="MiniCPM41ForCausalLM",
+    architecture="MiniCPMForCausalLM",
     module_name="minicpm41",
     category=ModelCategory.TEXT_GENERATION,
     primary_use=ModelCategory.TEXT_GENERATION,
 )
-class MiniCPM41ForCausalLM(ModelForCasualLM):
+class MiniCPMForCausalLM(ModelForCasualLM):
     """
     MiniCPM4.1-8B model for FastDeploy
 
@@ -65,18 +65,25 @@ class MiniCPM41ForCausalLM(ModelForCasualLM):
     """
 
     def __init__(self, fd_config: FDConfig):
-        super().__init__()
+        super().__init__(fd_config)
         self.fd_config = fd_config
         self.model_config = fd_config.model_config
 
+        # Pre-validate and fix model configuration before initializing layers
+        self._fix_model_config()
+        breakpoint()
         # Embedding layer
-        self.embed_tokens = VocabParallelEmbedding(fd_config, prefix="model.embed_tokens")
-
+        self.embed_tokens = VocabParallelEmbedding(
+            fd_config=fd_config,
+            num_embeddings=self.model_config.vocab_size,
+            embedding_dim=self.model_config.hidden_size,
+            prefix="model.embed_tokens",
+            general=True,
+        )
         # Decoder layers
-        self.layers = nn.LayerList([
-            MiniCPM41DecoderLayer(fd_config, layer_id=i)
-            for i in range(self.model_config.num_hidden_layers)
-        ])
+        self.layers = nn.LayerList(
+            [MiniCPM41DecoderLayer(fd_config, layer_id=i) for i in range(self.model_config.num_hidden_layers)]
+        )
 
         # Normalization layer
         self.norm = RMSNorm(
@@ -88,8 +95,12 @@ class MiniCPM41ForCausalLM(ModelForCasualLM):
         )
 
         # LM head for causal LM
-        self.lm_head = ParallelLMHead(fd_config, prefix="lm_head")
-
+        self.lm_head = ParallelLMHead(
+            fd_config=fd_config,
+            embedding_dim=self.model_config.hidden_size,
+            num_embeddings=self.model_config.vocab_size,
+            prefix="lm_head",
+        )
         # Sparse attention configuration
         self.sparse_config = getattr(self.model_config, "sparse_config", None)
 
@@ -97,6 +108,54 @@ class MiniCPM41ForCausalLM(ModelForCasualLM):
         self.rope_scaling = getattr(self.model_config, "rope_scaling", None)
 
         self.config = fd_config.model_config
+
+    def _fix_model_config(self):
+        """Fix model configuration to match MiniCPM4.1-8B config.json BEFORE initializing layers"""
+        print("🔧 Pre-initializing Model Configuration:")
+
+        # Key configuration parameters from config.json
+        config_params = {
+            "vocab_size": 73448,
+            "hidden_size": 4096,
+            "intermediate_size": 16384,
+            "num_attention_heads": 32,
+            "num_hidden_layers": 32,
+            "num_key_value_heads": 2,
+            "max_position_embeddings": 65536,
+            "rms_norm_eps": 1e-06,
+            "tie_word_embeddings": False,
+            "rope_theta": 10000.0,
+            "scale_emb": 12,
+            "scale_depth": 1.4,
+            "mup_denominator": 32,
+            "dim_model_base": 256,
+        }
+
+        # Update all model config parameters
+        for param_name, expected_value in config_params.items():
+            actual_value = getattr(self.model_config, param_name, None)
+            if actual_value != expected_value:
+                setattr(self.model_config, param_name, expected_value)
+                print(f"   ✓ Set {param_name}: {expected_value}")
+            else:
+                print(f"   ✓ {param_name}: {actual_value}")
+
+        # Add rope_scaling configuration
+        rope_scaling = {
+            "rope_type": "longrope",
+            "long_factor": [0.9982316082870437, 1.033048153422584, 1.0749920956484724],
+            "short_factor": [0.9982316082870437, 1.033048153422584, 1.0749920956484724],
+            "original_max_position_embeddings": 65536,
+        }
+        setattr(self.model_config, "rope_scaling", rope_scaling)
+        print(f"   ✓ Added rope_scaling: longrope")
+
+        print(f"   🎉 Model configuration fixed for MiniCPM4.1-8B!")
+
+    @classmethod
+    def name(cls) -> str:
+        """ """
+        return "MiniCPMForCausalLM"
 
     def forward(
         self,
@@ -201,9 +260,7 @@ class MiniCPM41ForCausalLM(ModelForCasualLM):
             attentions=all_self_attentions,
         )
 
-    def compute_logits(
-        self, hidden_states: paddle.Tensor, **kwargs
-    ) -> paddle.Tensor:
+    def compute_logits(self, hidden_states: paddle.Tensor, **kwargs) -> paddle.Tensor:
         """Compute logits from hidden states"""
         return self.lm_head(hidden_states)
 
@@ -231,11 +288,11 @@ class MiniCPM41ForCausalLM(ModelForCasualLM):
         if position_ids is None:
             # Calculate position IDs based on past length
             if past_key_values is not None:
-                position_ids = paddle.full(
-                    (input_ids.shape[0], 1), past_length, dtype="int64"
-                )
+                position_ids = paddle.full((input_ids.shape[0], 1), past_length, dtype="int64")
             else:
-                position_ids = paddle.arange(input_ids.shape[1], dtype="int64").expand([input_ids.shape[0], input_ids.shape[1]])
+                position_ids = paddle.arange(input_ids.shape[1], dtype="int64").expand(
+                    [input_ids.shape[0], input_ids.shape[1]]
+                )
 
         # Return prepared inputs
         return {
@@ -245,55 +302,250 @@ class MiniCPM41ForCausalLM(ModelForCasualLM):
             "past_key_values": past_key_values,
         }
 
+    def load_weights(self, weights_iterator):
+        """
+        Load weights from iterator with precise mapping for MiniCPM4.1-8B
+
+        Args:
+            weights_iterator: Iterator yielding (param_name, param_value) tuples
+        """
+        # Precise parameter mapping based on model.safetensors.index.json
+        param_mapping = {
+            # Attention layers - separate Q, K, V projections
+            "model.layers.{i}.self_attn.q_proj.weight": "layers.{i}.self_attn.q_proj.weight",
+            "model.layers.{i}.self_attn.k_proj.weight": "layers.{i}.self_attn.k_proj.weight",
+            "model.layers.{i}.self_attn.v_proj.weight": "layers.{i}.self_attn.v_proj.weight",
+            "model.layers.{i}.self_attn.o_proj.weight": "layers.{i}.self_attn.o_proj.weight",
+            # MLP layers
+            "model.layers.{i}.mlp.gate_proj.weight": "layers.{i}.mlp.gate_proj.weight",
+            "model.layers.{i}.mlp.up_proj.weight": "layers.{i}.mlp.up_proj.weight",
+            "model.layers.{i}.mlp.down_proj.weight": "layers.{i}.mlp.down_proj.weight",
+            # Layer normalization
+            "model.layers.{i}.input_layernorm.weight": "layers.{i}.input_layernorm.weight",
+            "model.layers.{i}.post_attention_layernorm.weight": "layers.{i}.post_attention_layernorm.weight",
+            # Embeddings and output layers - VocabParallelEmbedding and ParallelLMHead have different internal structure
+            "model.embed_tokens.weight": "embed_tokens.embeddings.weight",
+            "model.norm.weight": "norm.weight",
+            "lm_head.weight": "lm_head.linear.weight",
+        }
+
+        # Debug model structure (configuration already fixed in __init__)
+        self._debug_model_paths()
+
+        loaded_count = 0
+        failed_params = []
+        breakpoint()
+        for name, loaded_weight in weights_iterator:
+            # Special handling for embed_tokens and lm_head - try multiple paths
+            if name == "model.embed_tokens.weight":
+                # Check and fix vocabulary size mismatch
+                actual_vocab_size = loaded_weight.shape[0]
+                expected_vocab_size = self.model_config.vocab_size
+
+                if actual_vocab_size != expected_vocab_size:
+                    print(f"⚠️  Vocabulary size mismatch:")
+                    print(f"   Expected: {expected_vocab_size}")
+                    print(f"   Actual: {actual_vocab_size}")
+
+                    # Update model config to match weights
+                    self.model_config.vocab_size = actual_vocab_size
+                    print(f"   ✓ Updated model vocab_size to {actual_vocab_size}")
+
+                # Try different possible paths for embed_tokens
+                paths_to_try = ["embed_tokens.embeddings.weight", "embed_tokens.weight"]
+                loaded_successfully = False
+                for target_name in paths_to_try:
+                    param = self._get_parameter_by_path(target_name)
+                    if param is not None:
+                        try:
+                            param.set_value(loaded_weight)
+                            loaded_count += 1
+                            print(f"✓ Loaded embed_tokens weight as {target_name} (shape: {loaded_weight.shape})")
+                            loaded_successfully = True
+                            break
+                        except Exception as e:
+                            print(f"✗ Error setting embed_tokens weight as {target_name}: {e}")
+
+                if not loaded_successfully:
+                    print(f"✗ Failed to load embed_tokens weight")
+                    failed_params.append(name)
+                continue
+
+            elif name == "lm_head.weight":
+                # Fix lm_head weight transpose issue
+                # Weight files often store embeddings as [vocab_size, hidden_size]
+                # but linear layers expect [hidden_size, vocab_size]
+                print(f"📝 Processing lm_head weight (original shape: {loaded_weight.shape})")
+
+                # Check if we need to transpose
+                lm_head_param = self._get_parameter_by_path("lm_head.linear.weight")
+                if lm_head_param is not None:
+                    expected_shape = lm_head_param.shape
+                    print(f"   Expected shape: {expected_shape}")
+
+                    # Transpose if needed: [vocab_size, hidden_size] -> [hidden_size, vocab_size]
+                    if loaded_weight.shape != expected_shape:
+                        print(f"   🔄 Transposing lm_head weight")
+                        loaded_weight = loaded_weight.transpose([1, 0])
+                        print(f"   ✓ New shape: {loaded_weight.shape}")
+
+                # Try different possible paths for lm_head
+                paths_to_try = ["lm_head.linear.weight", "lm_head.weight"]
+                loaded_successfully = False
+                for target_name in paths_to_try:
+                    param = self._get_parameter_by_path(target_name)
+                    if param is not None:
+                        try:
+                            param.set_value(loaded_weight)
+                            loaded_count += 1
+                            print(f"✓ Loaded lm_head weight as {target_name} (shape: {loaded_weight.shape})")
+                            loaded_successfully = True
+                            break
+                        except Exception as e:
+                            print(f"✗ Error setting lm_head weight as {target_name}: {e}")
+
+                if not loaded_successfully:
+                    print(f"✗ Failed to load lm_head weight")
+                    failed_params.append(name)
+                continue
+
+            # Map parameter name from safetensors to FastDeploy format
+            target_name = self._map_param_name(name, param_mapping)
+
+            # Get parameter by path
+            param = self._get_parameter_by_path(target_name)
+
+            if param is not None:
+                try:
+                    param.set_value(loaded_weight)
+                    loaded_count += 1
+                except Exception as e:
+                    print(f"Error setting weight for {target_name}: {e}")
+                    failed_params.append(target_name)
+            else:
+                print(f"Warning: Parameter {target_name} not found")
+                failed_params.append(target_name)
+
+        print(f"\n📊 Weight Loading Summary:")
+        print(f"   ✓ Successfully loaded: {loaded_count} parameters")
+        if failed_params:
+            print(f"   ❌ Failed to load: {len(failed_params)} parameters")
+            print(f"   Failed parameters:")
+            for param in failed_params[:5]:  # Show first 5 failed parameters
+                print(f"     - {param}")
+            if len(failed_params) > 5:
+                print(f"     ... and {len(failed_params) - 5} more")
+        else:
+            print(f"   🎉 All parameters loaded successfully!")
+
+        # Final compatibility check
+        print(f"\n🔍 Final Compatibility Check:")
+        print(f"   Model vocab_size: {self.model_config.vocab_size}")
+        if hasattr(self, "embed_tokens") and hasattr(self.embed_tokens, "embeddings"):
+            print(f"   embed_tokens shape: {self.embed_tokens.embeddings.weight.shape}")
+        if hasattr(self, "lm_head") and hasattr(self.lm_head, "linear"):
+            print(f"   lm_head linear shape: {self.lm_head.linear.weight.shape}")
+        print(f"   Total layers: {len(self.layers)}")
+        breakpoint()
+        # Critical: If any parameters failed to load, raise an error to prevent segfault
+        if failed_params:
+            critical_params = [p for p in failed_params if "embed_tokens" in p or "lm_head" in p]
+            if critical_params:
+                print(f"\n❌ CRITICAL ERROR: Failed to load critical parameters: {critical_params}")
+                print(f"   This may cause segmentation faults during inference.")
+                print(f"   Please check model configuration and weight file compatibility.")
+                raise RuntimeError(f"Failed to load critical parameters: {critical_params}")
+            else:
+                print(f"\n⚠️  WARNING: Some non-critical parameters failed to load.")
+                print(f"   Model may still function with degraded performance.")
+
+    def _map_param_name(self, orig_name: str, param_mapping: dict) -> str:
+        """Map parameter name from safetensors format to FastDeploy format"""
+        import re
+
+        # Handle layer-specific parameters
+        for pattern, template in param_mapping.items():
+            if "{i}" in pattern:
+                # Replace {i} with regex pattern to match layer numbers
+                regex_pattern = pattern.replace("{i}", r"(\d+)")
+                match = re.fullmatch(regex_pattern, orig_name)
+                if match:
+                    layer_id = match.group(1)
+                    return template.replace("{i}", layer_id)
+            elif orig_name == pattern:
+                return template
+
+        # Default behavior: remove "model." prefix if present
+        if orig_name.startswith("model."):
+            return orig_name[6:]
+
+        return orig_name
+
+    def _get_parameter_by_path(self, param_path: str):
+        """Get parameter object by navigating through the model structure"""
+        parts = param_path.split(".")
+        current = self
+
+        try:
+            for part in parts:
+                # Handle list access like "layers[0]"
+                if "[" in part and part.endswith("]"):
+                    attr_name = part.split("[")[0]
+                    index = int(part.split("[")[1].split("]")[0])
+                    current = getattr(current, attr_name)[index]
+                else:
+                    current = getattr(current, part)
+
+            # Return the weight parameter
+            if hasattr(current, "weight"):
+                return current.weight
+            elif hasattr(current, "set_value"):
+                return current
+            else:
+                return None
+
+        except (AttributeError, IndexError, KeyError):
+            return None
+
+    def _debug_model_paths(self):
+        """Debug function to check actual parameter paths in the model"""
+        print("=== Model Parameter Paths Debug ===")
+
+        # Check embed_tokens
+        if hasattr(self, "embed_tokens"):
+            print(f"embed_tokens type: {type(self.embed_tokens)}")
+            if hasattr(self.embed_tokens, "embeddings"):
+                print(f"embed_tokens.embeddings weight shape: {self.embed_tokens.embeddings.weight.shape}")
+            elif hasattr(self.embed_tokens, "weight"):
+                print(f"embed_tokens weight shape: {self.embed_tokens.weight.shape}")
+
+        # Check lm_head
+        if hasattr(self, "lm_head"):
+            print(f"lm_head type: {type(self.lm_head)}")
+            if hasattr(self.lm_head, "linear"):
+                print(f"lm_head.linear weight shape: {self.lm_head.linear.weight.shape}")
+            elif hasattr(self.lm_head, "weight"):
+                print(f"lm_head weight shape: {self.lm_head.weight.shape}")
+
+        # Check norm
+        if hasattr(self, "norm"):
+            print(f"norm type: {type(self.norm)}")
+            print(f"norm weight shape: {self.norm.weight.shape}")
+
     def set_state_dict(self, state_dict: Dict[str, paddle.Tensor]) -> None:
         """
-        Set state dict with weight mapping
+        Set state dict with weight mapping (required by ModelForCasualLM base class)
+
+        Args:
+            state_dict: Dictionary mapping parameter names to tensors
         """
-        weights_mapper = WeightsMapper(
-            orig_to_new_prefix={
-                "model.": "",
-                "transformer.": "",
-            },
-            orig_to_new_subfix={
-                ".weight": ".weight",
-                ".bias": ".bias",
-            },
-        )
 
-        # Map weights
-        state_dict = weights_mapper(state_dict)
+        # Convert state dict to iterator format and reuse load_weights logic
+        def state_dict_iterator():
+            for name, tensor in state_dict.items():
+                yield name, tensor
 
-        # Handle special weight name mappings for MiniCPM4.1
-        mapped_state_dict = {}
-        for key, value in state_dict.items():
-            # Map attention weights
-            if "attention.wq.weight" in key:
-                new_key = key.replace("attention.wq.weight", "self_attn.qkv_proj.q_proj.weight")
-            elif "attention.wk.weight" in key:
-                new_key = key.replace("attention.wk.weight", "self_attn.qkv_proj.k_proj.weight")
-            elif "attention.wv.weight" in key:
-                new_key = key.replace("attention.wv.weight", "self_attn.qkv_proj.v_proj.weight")
-            elif "attention.wo.weight" in key:
-                new_key = key.replace("attention.wo.weight", "self_attn.o_proj.weight")
-            # Map feed-forward weights
-            elif "feed_forward.w1.weight" in key:
-                new_key = key.replace("feed_forward.w1.weight", "mlp.gate_proj.weight")
-            elif "feed_forward.w2.weight" in key:
-                new_key = key.replace("feed_forward.w2.weight", "mlp.down_proj.weight")
-            elif "feed_forward.w3.weight" in key:
-                new_key = key.replace("feed_forward.w3.weight", "mlp.up_proj.weight")
-            # Map normalization weights
-            elif "attention_norm.weight" in key:
-                new_key = key.replace("attention_norm.weight", "input_layernorm.weight")
-            elif "ffn_norm.weight" in key:
-                new_key = key.replace("ffn_norm.weight", "post_attention_layernorm.weight")
-            else:
-                new_key = key
-
-            mapped_state_dict[new_key] = value
-
-        # Set state dict
-        self.load_dict(mapped_state_dict)
+        self.load_weights(state_dict_iterator())
 
     @property
     def dtype(self):
@@ -315,11 +567,7 @@ class MiniCPM41DecoderLayer(nn.Layer):
         self.prefix = prefix
 
         # Self-attention
-        self.self_attn = MiniCPM41Attention(
-            fd_config,
-            layer_id=layer_id,
-            prefix=f"{prefix}.self_attn"
-        )
+        self.self_attn = MiniCPM41Attention(fd_config, layer_id=layer_id, prefix=f"{prefix}.self_attn")
 
         # Input layernorm (pre-attention norm)
         self.input_layernorm = RMSNorm(
@@ -331,11 +579,7 @@ class MiniCPM41DecoderLayer(nn.Layer):
         )
 
         # MLP
-        self.mlp = MiniCPM41MLP(
-            fd_config,
-            layer_id=layer_id,
-            prefix=f"{prefix}.mlp"
-        )
+        self.mlp = MiniCPM41MLP(fd_config, layer_id=layer_id, prefix=f"{prefix}.mlp")
 
         # Post-attention layernorm
         self.post_attention_layernorm = RMSNorm(
@@ -429,14 +673,41 @@ class MiniCPM41Attention(nn.Layer):
         self.layer_id = layer_id
         self.prefix = prefix
 
-        # Compute head dimension
+        # Compute head dimensions
         self.head_dim = self.model_config.hidden_size // self.model_config.num_attention_heads
 
-        # QKV parallel linear projection
-        self.qkv_proj = QKVParallelLinear(
+        # Check for GQA (Grouped Query Attention) configuration
+        self.num_key_value_heads = getattr(
+            self.model_config, "num_key_value_heads", self.model_config.num_attention_heads
+        )
+        self.kv_dim = self.head_dim * self.num_key_value_heads
+
+        # Separate Q, K, V linear projections (matching MiniCPM4.1-8B structure)
+        # Q projection uses full hidden_size (all heads)
+        self.q_proj = RowParallelLinear(
             fd_config,
-            prefix=f"{prefix}.qkv_proj",
-            with_bias=False,
+            prefix=f"{prefix}.q_proj",
+            input_size=self.model_config.hidden_size,
+            output_size=self.model_config.hidden_size,
+            layer_id=layer_id,
+        )
+
+        # K projection uses kv_dim (grouped query attention)
+        self.k_proj = RowParallelLinear(
+            fd_config,
+            prefix=f"{prefix}.k_proj",
+            input_size=self.model_config.hidden_size,
+            output_size=self.kv_dim,
+            layer_id=layer_id,
+        )
+
+        # V projection uses kv_dim (grouped query attention)
+        self.v_proj = RowParallelLinear(
+            fd_config,
+            prefix=f"{prefix}.v_proj",
+            input_size=self.model_config.hidden_size,
+            output_size=self.kv_dim,
+            layer_id=layer_id,
         )
 
         # Output projection
@@ -489,15 +760,25 @@ class MiniCPM41Attention(nn.Layer):
         Forward pass of attention
         """
 
-        # QKV projection
-        qkv = self.qkv_proj(hidden_states)
+        # Separate Q, K, V projections (matching MiniCPM4.1-8B structure)
+        queries = self.q_proj(hidden_states)
+        keys = self.k_proj(hidden_states)
+        values = self.v_proj(hidden_states)
 
-        # Split QKV
-        batch_size, seq_len, _ = qkv.shape
-        qkv = qkv.reshape([batch_size, seq_len, 3, self.model_config.num_attention_heads, self.head_dim])
-        qkv = qkv.transpose([2, 0, 3, 1, 4])  # [3, batch_size, num_heads, seq_len, head_dim]
+        # Reshape for multi-head attention
+        batch_size, seq_len, hidden_size = queries.shape
 
-        queries, keys, values = qkv[0], qkv[1], qkv[2]
+        # Q reshape: [batch_size, seq_len, num_q_heads, head_dim]
+        queries = queries.reshape([batch_size, seq_len, self.model_config.num_attention_heads, self.head_dim])
+
+        # K, V reshape: [batch_size, seq_len, num_kv_heads, head_dim]
+        keys = keys.reshape([batch_size, seq_len, self.num_key_value_heads, self.head_dim])
+        values = values.reshape([batch_size, seq_len, self.num_key_value_heads, self.head_dim])
+
+        # Transpose to [batch_size, num_heads, seq_len, head_dim]
+        queries = queries.transpose([0, 2, 1, 3])
+        keys = keys.transpose([0, 2, 1, 3])
+        values = values.transpose([0, 2, 1, 3])
 
         # Apply Q/K normalization if enabled
         if self.q_norm is not None and self.k_norm is not None:
@@ -552,12 +833,15 @@ class MiniCPM41MLP(nn.Layer):
         self.layer_id = layer_id
         self.prefix = prefix
 
+        # Get intermediate_size from config or default to 4 * hidden_size
+        intermediate_size = getattr(self.model_config, "intermediate_size", 4 * self.model_config.hidden_size)
+
         # Gate projection (for SwiGLU)
         self.gate_proj = RowParallelLinear(
             fd_config,
             prefix=f"{prefix}.gate_proj",
             input_size=self.model_config.hidden_size,
-            output_size=self.model_config.intermediate_size,
+            output_size=intermediate_size,
             layer_id=layer_id,
         )
 
@@ -566,7 +850,7 @@ class MiniCPM41MLP(nn.Layer):
             fd_config,
             prefix=f"{prefix}.up_proj",
             input_size=self.model_config.hidden_size,
-            output_size=self.model_config.intermediate_size,
+            output_size=intermediate_size,
             layer_id=layer_id,
         )
 
@@ -574,7 +858,7 @@ class MiniCPM41MLP(nn.Layer):
         self.down_proj = RowParallelLinear(
             fd_config,
             prefix=f"{prefix}.down_proj",
-            input_size=self.model_config.intermediate_size,
+            input_size=intermediate_size,
             output_size=self.model_config.hidden_size,
             layer_id=layer_id,
         )
